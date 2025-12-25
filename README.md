@@ -1,69 +1,150 @@
+Data schema:
+import { pgTable, text, serial, integer, timestamp, jsonb } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
 
-# VeritasScan 🛡️
+export const analyses = pgTable("analyses", {
+  id: serial("id").primaryKey(),
+  content: text("content").notNull(),
+  verdict: text("verdict").notNull(), // "likely_real", "likely_fake", "uncertain"
+  score: integer("score").notNull(), // 0-100 credibility score
+  explanation: text("explanation").notNull(),
+  analysisJson: jsonb("analysis_json").notNull(), // Store full breakdown
+  createdAt: timestamp("created_at").defaultNow(),
+});
 
-VeritasScan is a mobile-friendly web application that helps users assess the credibility of messages and news content commonly shared on messaging platforms and social media. It provides an AI-assisted analysis to identify potential misinformation and explains the reasoning behind each assessment.
+export const insertAnalysisSchema = createInsertSchema(analyses).omit({ 
+  id: true, 
+  createdAt: true 
+});
 
----
+export type Analysis = typeof analyses.$inferSelect;
+export type InsertAnalysis = z.infer<typeof insertAnalysisSchema>;
 
-## 🚀 Problem Statement
+export type CreateAnalysisRequest = {
+  content: string;
+};
 
-Misinformation spreads rapidly through WhatsApp forwards, viral posts, and informal news sources. Many users lack quick and accessible tools to verify content, leading to confusion, panic, and the spread of false information.
+export type AnalysisResponse = Analysis;
 
----
+Api Logic:
+import { z } from 'zod';
+import { insertAnalysisSchema, analyses } from './schema';
 
-## 💡 Solution
+export const errorSchemas = {
+  validation: z.object({
+    message: z.string(),
+    field: z.string().optional(),
+  }),
+  notFound: z.object({
+    message: z.string(),
+  }),
+  internal: z.object({
+    message: z.string(),
+  }),
+};
 
-VeritasScan allows users to paste any message or news text and instantly receive:
-- A credibility assessment
-- A clear explanation of why the content may be misleading
+export const api = {
+  analyses: {
+    create: {
+      method: 'POST' as const,
+      path: '/api/analyze',
+      input: z.object({
+        content: z.string().min(10, "Content must be at least 10 characters long").max(5000, "Content too long"),
+      }),
+      responses: {
+        200: z.custom<typeof analyses.$inferSelect>(),
+        400: errorSchemas.validation,
+        500: errorSchemas.internal,
+      },
+    },
+    list: {
+      method: 'GET' as const,
+      path: '/api/analyses',
+      responses: {
+        200: z.array(z.custom<typeof analyses.$inferSelect>()),
+      },
+    },
+  },
+};
 
-Instead of simply labeling content as “fake” or “real,” VeritasScan highlights indicators such as emotional exaggeration, sensational claims, persuasive manipulation, and lack of credible sources. This encourages informed decision-making and critical thinking.
+export function buildUrl(path: string, params?: Record<string, string | number>): string {
+  let url = path;
+  if (params) {
+    Object.entries(params).forEach(([key, value]) => {
+      if (url.includes(`:${key}`)) {
+        url = url.replace(`:${key}`, String(value));
+      }
+    });
+  }
+  return url;
+}
 
----
+export type CreateAnalysisInput = z.infer<typeof api.analyses.create.input>;
+export type AnalysisResponse = z.infer<typeof api.analyses.create.responses[200]>;
 
-## ✨ Key Features
+Server Route:
+import type { Express } from "express";
+import { type Server } from "http";
+import { storage } from "./storage";
+import { api } from "@shared/routes";
+import { z } from "zod";
+import OpenAI from "openai";
+import { db } from "./db";
+import { analyses } from "@shared/schema";
+import { count } from "drizzle-orm";
 
-- 📄 Instant analysis of pasted text  
-- 🧠 AI-assisted credibility assessment  
-- 🔍 Explainable results (not just labels)  
-- 📱 Mobile-first, browser-based design  
-- 🔓 No login or installation required  
-- 🌐 Accessible via a public URL  
+const openai = new OpenAI({
+  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+});
 
----
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express
+): Promise<Server> {
+  app.post(api.analyses.create.path, async (req, res) => {
+    try {
+      const input = api.analyses.create.input.parse(req.body);
 
-## 🛠️ Tech Stack
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content: `You are an expert fact-checker and credibility analyst. 
+            Today is December 22, 2025. You have access to real-time information.
+            
+            Analyze the provided text for misinformation, emotional manipulation, and sensationalism.
+            
+            Return a JSON object:
+            {
+              "verdict": "likely_real" | "likely_fake" | "uncertain",
+              "score": number (0-100),
+              "explanation": "Concise summary.",
+              "analysis_json": { ... }
+            }`
+          },
+          { role: "user", content: input.content }
+        ],
+        response_format: { type: "json_object" },
+      });
 
-- **Frontend:** HTML, CSS, JavaScript  
-- **AI Integration:** Language model via API  
-- **Deployment:** Replit (Static Web Application)
+      const result = JSON.parse(completion.choices[0].message.content || "{}");
 
----
+      const analysis = await storage.createAnalysis({
+        content: input.content,
+        verdict: result.verdict,
+        score: result.score,
+        explanation: result.explanation,
+        analysisJson: result.analysis_json || {},
+      });
 
-## 🌍 Deployment
+      res.json(analysis);
+    } catch (err) {
+      res.status(500).json({ message: "Failed to analyze content" });
+    }
+  });
 
-The application is deployed as a **web-based static site** on Replit and can be accessed using a public URL. It works on both mobile and desktop browsers.
-
----
-
-## ⚠️ Disclaimer
-
-VeritasScan is a decision-support tool and does not claim absolute accuracy. The results are intended to assist users in evaluating information responsibly and should not be considered a definitive source of truth.
-
----
-
-## 📸 Demo
-
-Live Demo: *(Add your Replit Primary URL here)*
-
----
-
-## 👥 Team
-
-- *(Your Name / Team Name)*
-
----
-
-## 📄 License
-
-This project is developed for hackathon and educational purposes.
+  return httpServer;
+}
